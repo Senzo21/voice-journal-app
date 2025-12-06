@@ -1,5 +1,16 @@
-import React, { useEffect, useState, useRef } from "react";
-import { View, Text, StyleSheet, TextInput, FlatList, TouchableOpacity, Alert, Animated, Platform } from "react-native";
+// App.js
+import React, { useEffect, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  FlatList,
+  TouchableOpacity,
+  Alert,
+  Animated,
+  Platform,
+} from "react-native";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system";
 import * as Sharing from "expo-sharing";
@@ -8,192 +19,361 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import RecorderModal from "./src/components/RecorderModal";
 import NoteItem from "./src/components/NoteItem";
-import uuid from 'react-native-uuid';
-import sample1 from "./assets/sample1.wav";
-import sample2 from "./assets/sample2.wav";
+import FeedbackModal from "./src/components/FeedbackModal";
+import uuid from "react-native-uuid";
 
 const VOICE_DIR = FileSystem.documentDirectory + "voiceNotes/";
-const STORAGE_KEY = "voice_notes_v1";
+const STORAGE_KEY = "voice_notes_final_v1";
+const FEEDBACK_KEY = "voice_feedback_v1";
 
 export default function App() {
   const [notes, setNotes] = useState([]);
   const [search, setSearch] = useState("");
   const [recVisible, setRecVisible] = useState(false);
+  const [feedbackVisible, setFeedbackVisible] = useState(false);
   const scaleAnim = useRef(new Animated.Value(1)).current;
 
-  useEffect(()=>{
-    (async ()=>{
-      await FileSystem.makeDirectoryAsync(VOICE_DIR, { intermediates: true });
+  // Single global sound instance so playback doesn't overlap
+  const soundRef = useRef(null);
+  // keep track of currently playing note id
+  const [playingId, setPlayingId] = useState(null);
+  // playback progress state (0..1)
+  const [progress, setProgress] = useState(0);
+  // playback rate
+  const [rate, setRate] = useState(1.0);
+
+  useEffect(() => {
+    (async () => {
+      await FileSystem.makeDirectoryAsync(VOICE_DIR, { intermediates: true }).catch(() => {});
       const saved = await AsyncStorage.getItem(STORAGE_KEY);
-      if(!saved) {
-        // copy sample assets into documentDirectory and create initial notes
-        try {
-          const dest1 = VOICE_DIR + "sample1.wav";
-          const dest2 = VOICE_DIR + "sample2.wav";
-          // safe copy, ignore errors if already present
-          await FileSystem.copyAsync({ from: AssetToUri(sample1), to: dest1 }).catch(()=>{});
-          await FileSystem.copyAsync({ from: AssetToUri(sample2), to: dest2 }).catch(()=>{});
-          const now = Date.now();
-          const initial = [
-            { id: uuid.v4(), title: "Meeting Notes", uri: dest1, createdAt: now - 1000*60*60*24*2, duration:120000 },
-            { id: uuid.v4(), title: "Grocery List", uri: dest2, createdAt: now - 1000*60*60*24*3, duration:65000 },
-            { id: uuid.v4(), title: "Lecture", uri: dest1, createdAt: now - 1000*60*60*24*4, duration:260000 },
-            { id: uuid.v4(), title: "Reminder", uri: dest2, createdAt: now - 1000*60*60*24*5, duration:45000 }
-          ];
-          await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
-          setNotes(initial);
-          return;
-        } catch(e){ console.log("initial copy error", e); }
-      } else {
+      if (saved) {
         setNotes(JSON.parse(saved));
+      } else {
+        setNotes([]);
       }
     })();
-  },[]);
-
-  // Helper to get local uri for asset (works with packager or file)
-  function AssetToUri(mod) {
-    // mod may be a number or object depending on bundler; handle both by checking structure
-    if(typeof mod === "string") return mod;
-    try {
-      return mod;
-    } catch(e){ return mod; }
-  }
+    // cleanup on unmount
+    return () => {
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => {});
+        soundRef.current = null;
+      }
+    };
+  }, []);
 
   async function saveNotes(list) {
-    setNotes(list);
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  }
-
-  function formattedDate(ts) {
-    return new Date(ts).toLocaleString();
+    const sorted = list.sort((a, b) => b.createdAt - a.createdAt);
+    setNotes(sorted);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(sorted));
   }
 
   function filtered() {
-    if(!search) return notes;
+    if (!search) return notes;
     const s = search.toLowerCase();
-    return notes.filter(n=> (n.title||"").toLowerCase().includes(s) || formattedDate(n.createdAt).toLowerCase().includes(s));
+    return notes.filter(
+      (n) =>
+        (n.title || "").toLowerCase().includes(s) ||
+        new Date(n.createdAt).toLocaleString().toLowerCase().includes(s)
+    );
   }
 
-  // 🟦 FUNCTIONALITY CHANGE — accept a title from the recorder
-  async function addNoteFromRecording(uri, duration, title) {
+  // Add note from recorder (uri points to temp file). App moves file into voiceNotes dir.
+  async function addNoteFromRecording(tempUri, duration, title) {
     try {
       const id = uuid.v4();
-      const ext = uri.split(".").pop();
+      const ext = (tempUri && tempUri.split(".").pop()) || "m4a";
       const dest = VOICE_DIR + id + "." + ext;
-      await FileSystem.copyAsync({ from: uri, to: dest });
-      // 🟦 FUNCTIONALITY CHANGE — use user-provided title (fallback to "Voice Note")
-      const note = { id, title: title || "Voice Note", uri: dest, createdAt: Date.now(), duration };
-      const updated = [note, ...notes];
-      await saveNotes(updated);
-    } catch(e){ console.log("add note error", e); Alert.alert("Error","Could not add the recording."); }
+
+      try {
+        await FileSystem.moveAsync({ from: tempUri, to: dest });
+      } catch (e) {
+        await FileSystem.copyAsync({ from: tempUri, to: dest });
+        await FileSystem.deleteAsync(tempUri, { idempotent: true });
+      }
+
+      const note = {
+        id,
+        title: title && title.trim() ? title.trim() : "Untitled Recording",
+        uri: dest,
+        createdAt: Date.now(),
+        duration: duration || 0,
+        // optionally you can add waveform data later
+      };
+
+      await saveNotes([note, ...notes]);
+    } catch (e) {
+      console.log("add note error", e);
+      Alert.alert("Error", "Could not save the recording.");
+    }
+  }
+
+  async function renameNote(id, newTitle) {
+    const updated = notes.map((n) => (n.id === id ? { ...n, title: newTitle } : n));
+    await saveNotes(updated);
   }
 
   async function deleteNote(id) {
-    const note = notes.find(n=>n.id===id);
-    if(!note) return;
-    try { await FileSystem.deleteAsync(note.uri, { idempotent: true }); } catch(e){}
-    const filteredList = notes.filter(n=>n.id!==id);
+    const note = notes.find((n) => n.id === id);
+    if (!note) return;
+    try {
+      await FileSystem.deleteAsync(note.uri, { idempotent: true });
+    } catch (e) {
+      console.log("file delete error", e);
+    }
+    const filteredList = notes.filter((n) => n.id !== id);
     await saveNotes(filteredList);
+    // if we were playing it, stop
+    if (playingId === id) {
+      if (soundRef.current) {
+        try { await soundRef.current.stopAsync(); await soundRef.current.unloadAsync(); } catch {}
+        soundRef.current = null;
+      }
+      setPlayingId(null);
+      setProgress(0);
+    }
   }
 
+  // Try to find a reversed file for a note:
+  // convention: if note.uri is .../abcd.m4a, reversed file is .../abcd_rev.m4a
+  function reversedUriFor(note) {
+    if (!note || !note.uri) return null;
+    const i = note.uri.lastIndexOf(".");
+    const base = note.uri.slice(0, i);
+    const ext = note.uri.slice(i + 1);
+    return base + "_rev." + ext;
+  }
+
+  // Play/pause with playback speed and support for playing reversed file if requested.
+  // ⭐ Note: negative playback rate (true reverse) is not supported by expo-av.
+  // This function will attempt to play a pre-created reversed file if reverse=true and that file exists.
+  async function playPause(note, { reverse = false, requestedRate = 1.0 } = {}) {
+    try {
+      // If another note is playing — stop it first
+      if (soundRef.current) {
+        const status = await soundRef.current.getStatusAsync();
+        if (status.isLoaded) {
+          await soundRef.current.stopAsync();
+          await soundRef.current.unloadAsync();
+        }
+        soundRef.current = null;
+        setPlayingId(null);
+        setProgress(0);
+      }
+
+      // determine uri to play
+      let uriToPlay = note.uri;
+      if (reverse) {
+        const rev = reversedUriFor(note);
+        // check existence
+        const info = await FileSystem.getInfoAsync(rev);
+        if (info.exists) {
+          uriToPlay = rev;
+        } else {
+          Alert.alert(
+            "Reversed file not found",
+            "To play audio backward, a reversed audio file must exist. You can generate it offline and place it next to the original with a `_rev` suffix."
+          );
+          // fallback to normal
+          uriToPlay = note.uri;
+        }
+      }
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: uriToPlay },
+        { shouldPlay: true, rate: requestedRate, shouldCorrectPitch: true }
+      );
+      soundRef.current = sound;
+      setPlayingId(note.id);
+      setRate(requestedRate);
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (!status.isLoaded) {
+          return;
+        }
+        // update progress
+        if (status.durationMillis && status.positionMillis != null) {
+          setProgress(status.positionMillis / status.durationMillis);
+        }
+        if (status.didJustFinish) {
+          // finished, cleanup
+          soundRef.current && soundRef.current.unloadAsync().catch(() => {});
+          soundRef.current = null;
+          setPlayingId(null);
+          setProgress(0);
+        }
+      });
+    } catch (e) {
+      console.log("playPause err", e);
+      Alert.alert("Playback error", "Could not play the note.");
+    }
+  }
+
+  async function setPlaybackSpeed(newRate) {
+    setRate(newRate);
+    if (soundRef.current) {
+      try {
+        await soundRef.current.setRateAsync(newRate, true);
+      } catch (e) {
+        console.log("setRate err", e);
+      }
+    }
+  }
+
+  function animateFab() {
+    Animated.sequence([
+      Animated.timing(scaleAnim, { toValue: 1.08, duration: 160, useNativeDriver: true }),
+      Animated.timing(scaleAnim, { toValue: 1, duration: 160, useNativeDriver: true }),
+    ]).start();
+  }
+
+  // backup / restore
   async function backup() {
     try {
       const json = JSON.stringify(notes);
-      const path = FileSystem.documentDirectory + "voice_backup_" + Date.now() + ".json";
+      const path = FileSystem.documentDirectory + `voice_backup_${Date.now()}.json`;
       await FileSystem.writeAsStringAsync(path, json, { encoding: FileSystem.EncodingType.UTF8 });
       await Sharing.shareAsync(path);
-    } catch(e){ Alert.alert("Backup failed", String(e)); }
+    } catch (e) {
+      console.log("backup error", e);
+      Alert.alert("Backup failed", String(e));
+    }
   }
 
   async function restore() {
     try {
       const res = await DocumentPicker.getDocumentAsync({ type: "application/json" });
-      if(res.type !== "success") return;
+      if (res.type !== "success") return;
       const content = await FileSystem.readAsStringAsync(res.uri, { encoding: FileSystem.EncodingType.UTF8 });
       const imported = JSON.parse(content);
-      // simple restore: merge items that have file URIs available in app directory
-      const available = imported.filter(i=> i.uri && i.uri.includes("voiceNotes/"));
-      const merged = [...available, ...notes];
-      await saveNotes(merged);
-      Alert.alert("Restore", "Imported notes. Make sure audio files exist in the app's voiceNotes folder.");
-    } catch(e){ Alert.alert("Restore failed", String(e)); }
-  }
-
-  // FAB animation
-  function animateFab() {
-    Animated.sequence([
-      Animated.timing(scaleAnim, { toValue: 1.08, duration: 180, useNativeDriver: true }),
-      Animated.timing(scaleAnim, { toValue: 1, duration: 180, useNativeDriver: true })
-    ]).start();
+      const valid = imported.filter((i) => i.uri && i.uri.includes("voiceNotes/"));
+      await saveNotes([...valid, ...notes]);
+      Alert.alert("Restore", "Imported metadata. Ensure audio files exist in voiceNotes folder.");
+    } catch (e) {
+      console.log("restore err", e);
+      Alert.alert("Restore failed", String(e));
+    }
   }
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Voice Journal</Text>
+      <Text style={styles.header}>Voice Journal</Text>
 
-      <View style={styles.searchRow}>
-        <Ionicons name="search" size={20} color="#9aa0a6" />
-        <TextInput placeholder="Search" placeholderTextColor="#6f767a" style={styles.searchInput} value={search} onChangeText={setSearch} />
-        <TouchableOpacity onPress={backup} style={{marginLeft:8}}><Ionicons name="cloud-upload" size={22} color="#9aa0a6" /></TouchableOpacity>
-        <TouchableOpacity onPress={restore} style={{marginLeft:12}}><Ionicons name="cloud-download" size={22} color="#9aa0a6" /></TouchableOpacity>
+      <View style={styles.topRow}>
+        <View style={styles.searchBox}>
+          <Ionicons name="search" size={18} color="#9aa0a6" />
+          <TextInput
+            placeholder="Search by title or date"
+            placeholderTextColor="#6f767a"
+            style={styles.searchInput}
+            value={search}
+            onChangeText={setSearch}
+          />
+        </View>
+
+        <TouchableOpacity style={styles.iconBtn} onPress={backup}>
+          <Ionicons name="cloud-upload" size={18} color="#fff" />
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.iconBtn, { marginLeft: 8 }]} onPress={restore}>
+          <Ionicons name="cloud-download" size={18} color="#fff" />
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.iconBtn, { marginLeft: 8 }]} onPress={() => setFeedbackVisible(true)}>
+          <Ionicons name="chatbubble-ellipses" size={18} color="#fff" />
+        </TouchableOpacity>
       </View>
 
-      <FlatList data={filtered()} keyExtractor={i=>i.id} style={{marginTop:12}} contentContainerStyle={{paddingBottom:120}} renderItem={({item})=> (
-        <NoteItem note={item} onDelete={()=>{
-          Alert.alert("Delete","Delete this note?",[{text:"Cancel",style:"cancel"},{text:"Delete",style:"destructive", onPress: ()=> deleteNote(item.id)}]);
-        }} />
-      )} ListEmptyComponent={<View style={{padding:24}}><Text style={{color:"#9ba0a6"}}>No voice notes yet — tap the mic to record.</Text></View>} />
+      <FlatList
+        data={filtered()}
+        keyExtractor={(i) => i.id}
+        contentContainerStyle={{ paddingBottom: 160, paddingTop: 12 }}
+        renderItem={({ item }) => (
+          <NoteItem
+            note={item}
+            playing={playingId === item.id}
+            progress={playingId === item.id ? progress : 0}
+            onPlay={(opts = {}) => playPause(item, opts)}
+            onPause={async () => {
+              if (soundRef.current) {
+                try {
+                  await soundRef.current.pauseAsync();
+                  setPlayingId(null);
+                } catch {}
+              }
+            }}
+            onRename={(newTitle) => renameNote(item.id, newTitle)}
+            onDelete={() =>
+              Alert.alert("Delete recording", "Delete this voice note?", [
+                { text: "Cancel", style: "cancel" },
+                { text: "Delete", style: "destructive", onPress: () => deleteNote(item.id) },
+              ])
+            }
+            setPlaybackSpeed={setPlaybackSpeed}
+            currentRate={rate}
+            playReverse={() => playPause(item, { reverse: true, requestedRate: rate })}
+            requestPlay={(reverse = false) => playPause(item, { reverse, requestedRate: rate })}
+          />
+        )}
+        ListEmptyComponent={
+          <View style={{ padding: 24 }}>
+            <Text style={{ color: "#8a8f95" }}>No notes yet — tap the mic to create one.</Text>
+          </View>
+        }
+      />
 
       <Animated.View style={[styles.fab, { transform: [{ scale: scaleAnim }] }]}>
-        <TouchableOpacity onPress={()=>{ animateFab(); setRecVisible(true); }} style={{alignItems:"center"}}>
+        <TouchableOpacity
+          onPress={() => {
+            animateFab();
+            setRecVisible(true);
+          }}
+        >
           <Ionicons name="mic" size={28} color="#fff" />
         </TouchableOpacity>
       </Animated.View>
 
-      {/* 🟦 FUNCTIONALITY: RecorderModal now returns title too */}
-      <RecorderModal visible={recVisible} onClose={()=>setRecVisible(false)} onSave={addNoteFromRecording} />
+      <RecorderModal visible={recVisible} onClose={() => setRecVisible(false)} onSave={addNoteFromRecording} />
+
+      <FeedbackModal visible={feedbackVisible} onClose={() => setFeedbackVisible(false)} storageKey={FEEDBACK_KEY} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex:1, backgroundColor:"#0f0f10", paddingTop:60, paddingHorizontal:18 },
+  container: { flex: 1, backgroundColor: "#0f1012", paddingHorizontal: 18, paddingTop: 56 },
+  header: { color: "#fff", fontSize: 28, fontWeight: "800" },
 
-  // 🟧 UI CHANGE — larger, bolder header for more premium look
-  title: { fontSize:38, fontWeight:"900", color:"#fff", marginBottom:22, letterSpacing:0.4 },
+  topRow: { flexDirection: "row", alignItems: "center", marginTop: 12 },
 
-  // 🟧 UI CHANGE — frosted / glassy search bar with subtle shadow
-  searchRow: {
-    flexDirection:"row",
-    alignItems:"center",
-    backgroundColor:"rgba(255,255,255,0.04)",
-    padding:12,
-    borderRadius:16,
-    borderWidth:1,
-    borderColor:"rgba(255,255,255,0.06)",
-    shadowColor:"#000",
-    shadowOpacity:0.3,
-    shadowRadius:6,
-    shadowOffset:{ width:0, height:3 }
+  searchBox: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#151517",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
   },
 
-  searchInput: { flex:1, marginLeft:8, color:"#fff" },
+  searchInput: { marginLeft: 8, color: "#fff", flex: 1, fontSize: 15 },
 
-  // 🟧 UI CHANGE — glowing, larger FAB centered at bottom
+  iconBtn: {
+    marginLeft: 10,
+    backgroundColor: "#1f2230",
+    padding: 10,
+    borderRadius: 10,
+  },
+
   fab: {
-    position:"absolute",
-    bottom:32,
-    alignSelf:"center",
-    backgroundColor:"#1e88ff",
-    width:78,
-    height:78,
-    borderRadius:39,
-    alignItems:"center",
-    justifyContent:"center",
-    shadowColor:"#1e88ff",
-    shadowRadius:14,
-    shadowOpacity:0.6,
-    shadowOffset:{ height:0, width:0 },
-    elevation:12
-  }
+    position: "absolute",
+    bottom: 32,
+    alignSelf: "center",
+    backgroundColor: "#1e88ff",
+    width: 76,
+    height: 76,
+    borderRadius: 38,
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 12,
+  },
 });

@@ -1,107 +1,126 @@
-import React, { useEffect, useState } from "react";
-import { Modal, View, Text, StyleSheet, TouchableOpacity, Alert, ActivityIndicator, TextInput } from "react-native";
+import React, { useState, useEffect, useRef } from "react";
+import { View, Text, Modal, TouchableOpacity, StyleSheet, Animated } from "react-native";
 import { Audio } from "expo-av";
-import * as FileSystem from "expo-file-system";
 import { Ionicons } from "@expo/vector-icons";
 
 export default function RecorderModal({ visible, onClose, onSave }) {
   const [recording, setRecording] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
-  const [processing, setProcessing] = useState(false);
+  const waveAnim = useRef(new Animated.Value(1)).current;
+  const waveAnim2 = useRef(new Animated.Value(1)).current;
 
-  // 🟦 FUNCTIONALITY CHANGE — title state so user can name recording
-  const [title, setTitle] = useState("");
+  useEffect(() => {
+    if (isRecording) startWaveAnimation();
+    else stopWaveAnimation();
+  }, [isRecording]);
 
-  useEffect(()=>{
-    return ()=>{
-      if(recording) {
-        recording.stopAndUnloadAsync().catch(()=>{});
-      }
-    };
-  },[recording]);
+  function startWaveAnimation() {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(waveAnim, { toValue: 1.6, duration: 500, useNativeDriver: true }),
+        Animated.timing(waveAnim, { toValue: 1, duration: 500, useNativeDriver: true }),
+      ])
+    ).start();
 
-  async function start() {
-    try {
-      const perm = await Audio.requestPermissionsAsync();
-      if(!perm.granted) { Alert.alert("Permission required","Please allow microphone access."); return; }
-      await Audio.setAudioModeAsync({ allowsRecordingIOS:true, playsInSilentModeIOS:true });
-      const rec = new Audio.Recording();
-      await rec.prepareToRecordAsync(Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY);
-      await rec.startAsync();
-      setRecording(rec);
-      setIsRecording(true);
-    } catch(e){ Alert.alert("Error","Could not start recording."); }
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(waveAnim2, { toValue: 1.4, duration: 600, useNativeDriver: true }),
+        Animated.timing(waveAnim2, { toValue: 1, duration: 600, useNativeDriver: true }),
+      ])
+    ).start();
   }
 
-  async function stopAndSave() {
+  function stopWaveAnimation() {
+    waveAnim.stopAnimation();
+    waveAnim2.stopAnimation();
+  }
+
+  async function startRecording() {
     try {
-      setProcessing(true);
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      const status = await recording.getStatusAsync();
-      setIsRecording(false);
-      setRecording(null);
+      await Audio.requestPermissionsAsync();
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true });
 
-      // 🟦 FUNCTIONALITY CHANGE — pass title along with uri & duration
-      onSave(uri, status.durationMillis || 0, title && title.trim() ? title.trim() : "Voice Note");
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
 
-      setProcessing(false);
-      onClose();
-      // reset title for next recording
-      setTitle("");
-    } catch(e){ setProcessing(false); Alert.alert("Error","Could not save recording."); }
+      setRecording(recording);
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Recording failed", err);
+    }
+  }
+
+  async function stopRecording() {
+    if (!recording) return;
+
+    setIsRecording(false);
+    await recording.stopAndUnloadAsync();
+
+    const uri = recording.getURI();
+    const status = await recording.getStatusAsync();
+    const duration = status.durationMillis;
+
+    onSave(uri, duration);
+    onClose();
   }
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose} transparent>
-      <View style={styles.overlay}>
-        <View style={styles.card}>
-          <Text style={styles.title}>New Voice Note</Text>
-          <Text style={styles.sub}>Add a title (optional) and tap record. Save will store locally.</Text>
+    <Modal visible={visible} transparent animationType="slide">
+      <View style={styles.modalContainer}>
+        <Text style={styles.title}>Recording…</Text>
 
-          {/* 🟧 UI + 🟦 FUNCTIONALITY — Title input so user names the note */}
-          <TextInput
-            placeholder="Enter title..."
-            placeholderTextColor="#8a8f95"
-            value={title}
-            onChangeText={setTitle}
-            style={styles.titleInput}
-          />
-
-          <View style={{marginTop:10, alignItems:"center"}}>
-            <TouchableOpacity onPress={isRecording ? stopAndSave : start} style={[styles.recBtn, isRecording && {backgroundColor:"#d32f2f"}]}>
-              <Ionicons name={isRecording ? "stop" : "mic"} size={48} color="#fff" />
-            </TouchableOpacity>
-            {processing && <ActivityIndicator style={{marginTop:12}} />}
-          </View>
-
-          <View style={{marginTop:18, flexDirection:"row", justifyContent:"space-between"}}>
-            <TouchableOpacity onPress={() => { if(isRecording){ stopAndSave(); } else { setTitle(""); onClose(); } }}><Text style={{color:"#9aa0a6"}}>Close</Text></TouchableOpacity>
-            <TouchableOpacity onPress={() => { if(isRecording) stopAndSave(); else { if(title.trim()){ /* nothing */ } onClose(); } }}><Text style={{color:"#1e88ff"}}>Done</Text></TouchableOpacity>
-          </View>
+        {/* 🔊 Animated Sound Waves */}
+        <View style={styles.waveContainer}>
+          <Animated.View style={[styles.wave, { transform: [{ scale: waveAnim }] }]} />
+          <Animated.View style={[styles.waveSecondary, { transform: [{ scale: waveAnim2 }] }]} />
         </View>
+
+        <TouchableOpacity
+          style={styles.btn}
+          onPress={isRecording ? stopRecording : startRecording}
+        >
+          <Ionicons
+            name={isRecording ? "stop-circle" : "mic"}
+            size={45}
+            color="#fff"
+          />
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={onClose} style={{ marginTop: 20 }}>
+          <Text style={{ color: "#ccc" }}>Cancel</Text>
+        </TouchableOpacity>
       </View>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
-  overlay: { flex:1, backgroundColor:"rgba(0,0,0,0.5)", justifyContent:"center", alignItems:"center" },
-  card: { width:"90%", backgroundColor:"#0f0f10", padding:20, borderRadius:14, borderWidth:1, borderColor:"rgba(255,255,255,0.04)", shadowColor:"#000", shadowOpacity:0.3, shadowRadius:8 },
-  title: { fontSize:20, color:"#fff", fontWeight:"800" },
-  sub: { color:"#9aa0a6", marginTop:8, marginBottom:12 },
+  modalContainer: {
+    flex: 1, backgroundColor: "#000d", justifyContent: "center", alignItems: "center"
+  },
+  title: { color: "#fff", fontSize: 28, marginBottom: 40, fontWeight: "bold" },
 
-  // 🟧 UI CHANGE — title input style (glassy / modern)
-  titleInput: {
-    width: "100%",
-    backgroundColor: "rgba(255,255,255,0.02)",
-    color: "#fff",
-    padding: 12,
-    borderRadius: 12,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.03)"
+  waveContainer: {
+    width: 180, height: 180, justifyContent: "center", alignItems: "center"
   },
 
-  recBtn: { marginTop:10, width:120, height:120, borderRadius:60, backgroundColor:"#1e88ff", alignItems:"center", justifyContent:"center", shadowColor:"#1e88ff", shadowRadius:10, shadowOpacity:0.45 }
+  wave: {
+    width: 180, height: 180, borderRadius: 100,
+    backgroundColor: "rgba(30,144,255,0.25)",
+    position: "absolute",
+  },
+  waveSecondary: {
+    width: 130, height: 130,
+    borderRadius: 100,
+    backgroundColor: "rgba(30,144,255,0.35)",
+    position: "absolute",
+  },
+
+  btn: {
+    marginTop: 40,
+    backgroundColor: "#1890ff",
+    padding: 18,
+    borderRadius: 50,
+  }
 });
