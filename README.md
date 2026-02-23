@@ -6,4 +6,7 @@ How to run:
 3. Extract project and run: npm install
 4. Start: expo start
 
+Notes:
+- This project uses TypeScript. Run: npx tsc --noEmit
+
 This project includes sample silent WAV files in /assets to show the UI filled with notes.
